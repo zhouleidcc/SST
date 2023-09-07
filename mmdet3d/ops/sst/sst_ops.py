@@ -7,6 +7,78 @@ from mmdet3d.ops import spconv
 import torch_scatter
 from mmcv.cnn import build_norm_layer
 import traceback
+from torchex import connected_components as cc_gpu
+
+
+class scatter_bool(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, bool_indice):
+        assert len(bool_indice.shape) == 1
+        scatter_inds = torch.nonzero(bool_indice)[:, 0]
+        return scatter_inds
+
+    @staticmethod
+    def symbolic(g, bool_indice):
+        return g.op('zf::scatter_bool', bool_indice)
+
+scatter_bool_fun = scatter_bool.apply
+
+class Scatter_bool(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, bool_indice):
+        assert len(bool_indice.shape) == 1
+        scatter_inds = scatter_bool_fun(bool_indice)
+        return scatter_inds
+
+class Connected_componetFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, points, batch_idx, dist):
+        components_inds = cc_gpu(points, batch_idx, dist, 100, 2, False)
+        return components_inds
+
+    @staticmethod
+    def symbolic(g, points, batch_idx, dist):
+        return g.op('zf::connected_componet', points, batch_idx, dist_f=dist)
+
+Connected_componetFunc_fun = Connected_componetFunc.apply
+
+class Connected_componet(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, points, batch_idx, dist):
+        components_inds = Connected_componetFunc_fun(points, batch_idx, dist)
+        return components_inds
+
+class scatter_kernel(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, feat, unq_inv, count, num_points, mode):
+        assert mode in ('max', 'mean', 'sum', 'avg')
+        if mode == 'max':
+            new_feat = torch_scatter.scatter_max(feat, unq_inv, dim=0)[0]
+        elif mode == 'mean' or mode == 'avg':
+            new_feat = torch_scatter.scatter(feat, unq_inv, dim=0, reduce='mean')
+        else:
+            new_feat = torch_scatter.scatter(feat, unq_inv, dim=0, reduce='sum')
+        return new_feat
+
+    @staticmethod
+    def symbolic(g, feat, unq_inv, count, num_points, mode):
+        assert mode in ('max', 'mean', 'sum', 'avg')
+        return g.op('zf::scatter_sst', feat, unq_inv, count, num_points, mode_s=mode)
+scatter_fun = scatter_kernel.apply
+
+class scatter_sst(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, feat, unq_inv, count, num_points, mode='max'):
+        new_feat = scatter_fun(feat, unq_inv, count, num_points, mode)
+        return new_feat
+
+
 
 def scatter_nd(indices, updates, shape):
     """pytorch edition of tensorflow scatter_nd.

@@ -13,8 +13,8 @@ from .single_stage_mono3d import SingleStageMono3DDetector
 from .ssd3dnet import SSD3DNet
 from .votenet import VoteNet
 from .voxelnet import VoxelNet
-from .single_stage_fsd import SingleStageFSD, VoteSegmentor
-from .two_stage_fsd import FSD
+from .single_stage_fsd import SingleStageFSD, VoteSegmentor, SingleStageFSD_infer, VoteSegmentor_infer
+from .two_stage_fsd import FSD, FSD_infer
 from .single_stage_fsd_v2 import SingleStageFSDV2
 from .two_stage_fsd_v2 import FSDV2
 

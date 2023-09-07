@@ -9,7 +9,7 @@ from .. import builder
 from ..builder import VOXEL_ENCODERS
 from .utils import VFELayer, DynamicVFELayer, get_paddings_indicator,  DynamicVFELayerV2
 from ipdb import set_trace
-from mmdet3d.ops import make_sparse_convmodule, scatter_v2
+from mmdet3d.ops import make_sparse_convmodule, scatter_v2, scatter_sst
 from mmdet3d.ops import spconv as spconv
 import pickle as pkl
 import os
@@ -612,6 +612,161 @@ class DynamicScatterVFE(DynamicVFE):
             return voxel_feats, voxel_coors
 
 
+@VOXEL_ENCODERS.register_module()
+class DynamicScatterVFE_infer(DynamicVFE):
+    """ Same with DynamicVFE but use torch_scatter to avoid construct canvas in map_voxel_center_to_point.
+    The canvas is very memory-consuming when use tiny voxel size (5cm * 5cm * 5cm) in large 3D space.
+    """
+
+    def __init__(self,
+                 in_channels=4,
+                 feat_channels=[],
+                 with_distance=False,
+                 with_cluster_center=False,
+                 with_voxel_center=False,
+                 voxel_size=(0.2, 0.2, 4),
+                 point_cloud_range=(0, -40, -3, 70.4, 40, 1),
+                 norm_cfg=dict(type='BN1d', eps=1e-3, momentum=0.01),
+                 mode='max',
+                 fusion_layer=None,
+                 return_point_feats=False,
+                 return_inv=True,
+                 rel_dist_scaler=1.0,
+                 unique_once=False,
+                 ):
+        super(DynamicScatterVFE_infer, self).__init__(
+            in_channels,
+            feat_channels,
+            with_distance,
+            with_cluster_center,
+            with_voxel_center,
+            voxel_size,
+            point_cloud_range,
+            norm_cfg,
+            mode,
+            fusion_layer,
+            return_point_feats,
+        )
+        # overwrite
+        self.scatter = None
+        self.vfe_scatter = None
+        self.cluster_scatter = None
+        self.rel_dist_scaler = rel_dist_scaler
+        self.mode = mode
+        self.unique_once = unique_once
+
+    def map_voxel_center_to_point(self, voxel_mean, voxel2point_inds):
+
+        return voxel_mean[voxel2point_inds]
+
+    # if out_fp16=True, the large numbers of points
+    # lead to overflow error in following layers
+    @force_fp32(out_fp16=False)
+    def forward(self, points_xyzs, points_feat,
+                coors,
+                points=None,
+                img_feats=None,
+                img_metas=None,
+                return_inv=False,
+                coor_center=None):
+
+        if self.unique_once:
+            new_coors, unq_inv_once, count = torch.unique(coors, return_inverse=True, return_counts=True, dim=0)
+        else:
+            new_coors = unq_inv_once = None
+
+        features_ls = [points_xyzs, points_feat]
+        # origin_point_coors = points_xyzs
+        # Find distance of x, y, and z from cluster center
+        scatter_infer = scatter_sst()
+        num_voxel = count.cpu().numpy().shape[0]
+        num_voxel = torch.Tensor([num_voxel]).to(device=count.device, dtype=count.dtype)
+        if self._with_cluster_center:
+            # voxel_mean, _= scatter_v2(points_xyzs, coors, mode='avg', return_inv=False, new_coors=new_coors,
+            #                                     unq_inv=unq_inv_once)
+            voxel_mean = scatter_infer(points_xyzs, unq_inv_once, count, num_voxel, 'mean')
+
+            ###########
+            """
+            from torchex import scatter_sum, scatter_max, scatter_mean, TorchTimer, ScatterData
+            from copy import deepcopy
+            tmp = deepcopy(points_xyzs)
+            tmp = tmp.contiguous()
+            data = ScatterData(unq_inv_once, count)
+            ans2 = scatter_mean(tmp, data)
+            flag1 = bool(((voxel_mean - ans2) < 1e-5).all().cpu())
+            print(flag1)
+            """
+
+            ###########
+            unq_inv = unq_inv_once
+            points_mean = self.map_voxel_center_to_point(voxel_mean, unq_inv)
+            # TODO: maybe also do cluster for reflectivity
+            f_cluster = points_xyzs - points_mean
+            if self.rel_dist_scaler != 1.0:
+                f_cluster /= self.rel_dist_scaler
+            features_ls.append(f_cluster)
+        # Find distance of x, y, and z from pillar center
+        if self._with_voxel_center and coor_center is None:
+            if points is not None:
+                f_center = points
+            else:
+                f_center = features.new_zeros(size=(features.size(0), 3))
+                f_center[:, 0] = features[:, 0] - (
+                        coors[:, 3].type_as(features) * self.vx + self.x_offset)
+                f_center[:, 1] = features[:, 1] - (
+                        coors[:, 2].type_as(features) * self.vy + self.y_offset)
+                f_center[:, 2] = features[:, 2] - (
+                        coors[:, 1].type_as(features) * self.vz + self.z_offset)
+            features_ls.append(f_center)
+        elif self._with_voxel_center and coor_center is not None:
+            features_ls.append(coor_center)
+
+        if self._with_distance:
+            points_dist = torch.norm(points_xyzs, 2, 1, keepdim=True)
+            features_ls.append(points_dist)
+
+        # Combine together feature decorations
+        if len(features_ls) > 1:
+            features = torch.cat(features_ls, dim=-1)
+        else:
+            features = f_cluster
+
+        for i, vfe in enumerate(self.vfe_layers):
+            point_feats = vfe(features)
+
+            if (i == len(self.vfe_layers) - 1 and self.fusion_layer is not None
+                    and img_feats is not None):
+                point_feats = self.fusion_layer(img_feats, points, point_feats,
+                                                img_metas)
+            # voxel_feats, voxel_coors = scatter_v2(point_feats, coors, mode=self.mode, return_inv=False, new_coors=new_coors,
+            #                                                unq_inv=unq_inv_once)
+            voxel_feats = scatter_infer(point_feats, unq_inv_once, count, num_voxel, self.mode)
+            import numpy as np
+            np_point_feats = point_feats.cpu().numpy()
+            np_unq_inv_once = unq_inv_once.cpu().numpy()
+            np_count = count.cpu().numpy()
+            np_voxel_feats = voxel_feats.cpu().numpy()
+            path = '/home/nvidia/work/xavier_python_projects/python_projects/tensorrt_deploy_demo/sst/scatter/%s.npy'
+            np.save(path % 'point_feats', np_point_feats)
+            np.save(path % 'unq_inv_once', np_unq_inv_once)
+            np.save(path % 'count', np_count)
+            np.save(path % 'voxel_feats', np_voxel_feats)
+            voxel_coors = new_coors
+            unq_inv = unq_inv_once
+            if i != len(self.vfe_layers) - 1:
+                # need to concat voxel feats if it is not the last vfe
+                feat_per_point = self.map_voxel_center_to_point(voxel_feats, unq_inv)
+                features = torch.cat([point_feats, feat_per_point], dim=1)
+        if self.return_point_feats:
+            return point_feats
+
+        if return_inv:
+            return voxel_feats, voxel_coors, unq_inv, count
+        else:
+            return voxel_feats, voxel_coors
+
+
 from mmdet3d.ops import build_mlp
 
 @VOXEL_ENCODERS.register_module()
@@ -740,6 +895,173 @@ class SIRLayer(DynamicVFE):
             point_feats = vfe(features)
 
             voxel_feats, voxel_coors, unq_inv = scatter_v2(point_feats, coors, mode=self.mode, unq_inv=unq_inv_once, new_coors=new_coors_once)
+            voxel_feats_list.append(voxel_feats)
+            if i != len(self.vfe_layers) - 1:
+                # need to concat voxel feats if it is not the last vfe
+                feat_per_point = self.map_voxel_center_to_point(voxel_feats, unq_inv)
+                features = torch.cat([point_feats, feat_per_point], dim=1)
+
+        voxel_feats = torch.cat(voxel_feats_list, dim=1)
+
+        if return_both:
+            if self.with_shortcut and point_feats.shape == shortcut.shape:
+                point_feats = point_feats + shortcut
+            return point_feats, voxel_feats, voxel_coors
+
+        if self.return_point_feats:
+            if self.with_shortcut and point_feats.shape == shortcut.shape:
+                point_feats = point_feats + shortcut
+            return point_feats, voxel_feats
+
+        if return_inv:
+            return voxel_feats, voxel_coors, unq_inv
+        else:
+            return voxel_feats, voxel_coors
+
+
+@VOXEL_ENCODERS.register_module()
+class SIRLayer_infer(DynamicVFE):
+
+    def __init__(self,
+                 in_channels=4,
+                 feat_channels=[],
+                 with_distance=False,
+                 with_cluster_center=False,
+                 with_rel_mlp=True,
+                 rel_mlp_hidden_dims=[16, ],
+                 rel_mlp_in_channel=3,
+                 with_voxel_center=False,
+                 voxel_size=(0.2, 0.2, 4),
+                 point_cloud_range=(0, -40, -3, 70.4, 40, 1),
+                 norm_cfg=dict(type='BN1d', eps=1e-3, momentum=0.01),
+                 mode='max',
+                 fusion_layer=None,
+                 return_point_feats=False,
+                 return_inv=True,
+                 rel_dist_scaler=1.0,
+                 with_shortcut=True,
+                 xyz_normalizer=[1.0, 1.0, 1.0],
+                 act='relu',
+                 dropout=0.0,
+                 ):
+        super().__init__(
+            in_channels,
+            feat_channels,
+            with_distance,
+            with_cluster_center,
+            with_voxel_center,
+            voxel_size,
+            point_cloud_range,
+            norm_cfg,
+            mode,
+            fusion_layer,
+            return_point_feats,
+        )
+        # overwrite
+        self.scatter = None
+        self.vfe_scatter = None
+        self.cluster_scatter = None
+        self.rel_dist_scaler = rel_dist_scaler
+        self.mode = mode
+        self.with_shortcut = with_shortcut
+        self._with_rel_mlp = with_rel_mlp
+        self.xyz_normalizer = xyz_normalizer
+        self.scatter_export = scatter_sst()
+        self.xyz_normalizer_inverse = [1.0 /a for a in self.xyz_normalizer]
+        self.rel_dist_scaler_inverse = 1.0 /self.rel_dist_scaler
+        if with_rel_mlp:
+            rel_mlp_hidden_dims.append(in_channels)  # not self.in_channels
+            self.rel_mlp = build_mlp(rel_mlp_in_channel, rel_mlp_hidden_dims, norm_cfg, act=act)
+
+        if act != 'relu' or dropout > 0:  # do not double in_filter
+            feat_channels = [self.in_channels] + list(feat_channels)
+            vfe_layers = []
+            for i in range(len(feat_channels) - 1):
+                in_filters = feat_channels[i]
+                out_filters = feat_channels[i + 1]
+                if i > 0:
+                    in_filters *= 2
+
+                vfe_layers.append(
+                    DynamicVFELayerV2(
+                        in_filters,
+                        out_filters,
+                        norm_cfg,
+                        act=act,
+                        dropout=dropout,
+                    )
+                )
+            self.vfe_layers = nn.ModuleList(vfe_layers)
+            self.num_vfe = len(vfe_layers)
+
+    def map_voxel_center_to_point(self, voxel_mean, voxel2point_inds):
+
+        return voxel_mean[voxel2point_inds]
+
+    # if out_fp16=True, the large numbers of points
+    # lead to overflow error in following layers
+    @force_fp32(out_fp16=False)
+    def forward(self,
+                points_xyzs,
+                points_feat,
+                features,
+                coors,
+                f_cluster=None,
+                points=None,
+                img_feats=None,
+                img_metas=None,
+                return_inv=False,
+                return_both=False,
+                unq_inv_once=None,
+                new_coors_once=None,
+                count=None
+                ):
+
+        xyz_normalizer = torch.tensor(self.xyz_normalizer_inverse, device=features.device, dtype=features.dtype)
+        features_ls = [torch.cat([points_xyzs * xyz_normalizer[None, :], points_feat, features], dim=1)]
+        # origin_point_coors = points_xyzs
+        if self.with_shortcut:
+            shortcut = features
+        if f_cluster is None:
+            # Find distance of x, y, and z from cluster center
+            # voxel_mean = self.scatter_export(points_xyzs, unq_inv_once, 'mean')
+            # unq_inv = unq_inv_once
+            # mean_coors = new_coors_once
+            voxel_mean, mean_coors, unq_inv = scatter_v2(points_xyzs, coors, mode='avg', unq_inv=unq_inv_once,
+                                                         new_coors=new_coors_once)
+            points_mean = self.map_voxel_center_to_point(
+                voxel_mean, unq_inv)
+            # TODO: maybe also do cluster for reflectivity
+            f_cluster = (points_xyzs - points_mean[:, :3]) * self.rel_dist_scaler_inverse
+        else:
+            f_cluster = f_cluster * self.rel_dist_scaler_inverse
+
+        if self._with_cluster_center:
+            features_ls.append(f_cluster * 0.1)
+
+        if self._with_rel_mlp:
+            features_ls[0] = features_ls[0] * self.rel_mlp(f_cluster)
+
+        if self._with_distance:
+            points_dist = torch.norm(points_xyzs, 2, 1, keepdim=True)
+            features_ls.append(points_dist)
+
+        # Combine together feature decorations
+        if len(features_ls) == 1:
+            features = features_ls[0]
+        else:
+            features = torch.cat(features_ls, dim=-1)
+
+        voxel_feats_list = []
+        scatter_infer = scatter_sst()
+        for i, vfe in enumerate(self.vfe_layers):
+            point_feats = vfe(features)
+            mode = 'mean' if self.mode == 'avg' else self.mode
+            num_point = count.cpu().numpy().shape[0]
+            num_point = torch.Tensor([num_point]).to(device=count.device, dtype=count.dtype)
+            voxel_feats = scatter_infer(point_feats, unq_inv_once, count, num_point, mode)
+            voxel_coors = new_coors_once
+            unq_inv = unq_inv_once
             voxel_feats_list.append(voxel_feats)
             if i != len(self.vfe_layers) - 1:
                 # need to concat voxel feats if it is not the last vfe

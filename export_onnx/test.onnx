@@ -1,0 +1,39 @@
+pytorch1.13.1:á
+¿
+src.1
+index.1
+zf::scatter_sst_23/scatter_sst"scatter_sst*
+mode"max 2ç
+/home/nvidia/work/xavier_python_projects/python_projects/lidar_detector/tmp/SST/export_onnx/test.py(30): forward
+/home/nvidia/anaconda3/envs/triton/lib/python3.7/site-packages/torch/nn/modules/module.py(1182): _slow_forward
+/home/nvidia/anaconda3/envs/triton/lib/python3.7/site-packages/torch/nn/modules/module.py(1194): _call_impl
+/home/nvidia/anaconda3/envs/triton/lib/python3.7/site-packages/torch/jit/_trace.py(118): wrapper
+/home/nvidia/anaconda3/envs/triton/lib/python3.7/site-packages/torch/jit/_trace.py(132): forward
+/home/nvidia/anaconda3/envs/triton/lib/python3.7/site-packages/torch/nn/modules/module.py(1194): _call_impl
+/home/nvidia/anaconda3/envs/triton/lib/python3.7/site-packages/torch/jit/_trace.py(1184): _get_trace_graph
+/home/nvidia/anaconda3/envs/triton/lib/python3.7/site-packages/torch/onnx/utils.py(896): _trace_and_get_graph_from_model
+/home/nvidia/anaconda3/envs/triton/lib/python3.7/site-packages/torch/onnx/utils.py(987): _create_jit_graph
+/home/nvidia/anaconda3/envs/triton/lib/python3.7/site-packages/torch/onnx/utils.py(1111): _model_to_graph
+/home/nvidia/anaconda3/envs/triton/lib/python3.7/site-packages/torch/onnx/utils.py(1539): _export
+/home/nvidia/anaconda3/envs/triton/lib/python3.7/site-packages/torch/onnx/utils.py(519): export
+/home/nvidia/work/xavier_python_projects/python_projects/lidar_detector/tmp/SST/export_onnx/test.py(51): <module>
+:zf	torch_jitZ
+src.1
+
+
+âÐ
+@Z
+index.1
+
+
+âÐZ%
+zf::scatter_sst_2
+
+
+šª
+b7
+32
+0,
+scatter_sst3_dim_0
+scatter_sst3_dim_1BB
+zf
